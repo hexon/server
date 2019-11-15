@@ -1,0 +1,58 @@
+--source include/big_test.inc
+--source include/have_sequence.inc
+--source include/have_64bit.inc
+
+create table t1(a int);
+insert into t1 select seq from seq_1_to_10000 order by rand(3);
+
+CREATE TABLE t2(
+  id INT NOT NULL,
+  names VARCHAR(64),
+  address VARCHAR(132),
+  PRIMARY KEY (id)
+);
+
+delimiter |;
+
+CREATE FUNCTION f1(median float, a INT, b INT) RETURNS INT
+BEGIN
+  set @x= rand(a), @y= rand(b);
+  if (@x = 0) then
+   return round(median);
+  end if;
+  set @z = ((sqrt(-2*log(@x))*cos(2*pi()*@y))*5)+median;
+  set @z = round(@z);
+  if (@z = 0) then
+   return 1;
+  end if;
+  return @z;
+END|
+
+CREATE function f2(a INT, b INT) RETURNS varchar(256)
+BEGIN
+  DECLARE str VARCHAR(256) DEFAULT '';
+  DECLARE x INT DEFAULT 0;
+  WHILE (a > 0 AND a < 256) DO
+    set x =round(rand(b)*25);
+    set str= CONCAT(str, CHAR(65 + x));
+    set a= a-1;
+    set b= b+1;
+  END WHILE;
+  RETURN str;
+END|
+
+delimiter ;|
+
+insert into t2
+select a, f2(f1(12, a, a+1), a) , f2(f1(32, a+10, a+11) ,a)
+FROM t1;
+
+set sort_buffer_size=262144*10;
+flush status;
+select id, MD5(group_concat(names, address)) from t2 group by id DIV 100 ORDER BY id;
+show status like '%sort%';
+set sort_buffer_size=default;
+
+drop function f1;
+drop function f2;
+drop table t1,t2;
