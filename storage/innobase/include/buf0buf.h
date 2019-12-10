@@ -1374,6 +1374,10 @@ buf_page_encrypt_before_write(
 	buf_page_t*	bpage,
 	byte*		src_frame);
 
+/** Get the buffer pool chunk size in pages
+@return number of pages available in buffer pool */
+ulint buf_pool_get_curr_chunk_size();
+
 /** @brief The temporary memory structure.
 
 NOTE! The definition appears here only for other modules of this

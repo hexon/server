@@ -761,7 +761,6 @@ recv_sys_var_init(void)
 	recv_previous_parsed_rec_type = MLOG_SINGLE_REC_FLAG;
 	recv_previous_parsed_rec_offset	= 0;
 	recv_previous_parsed_rec_is_multi = 0;
-	recv_n_pool_free_frames	= 256;
 	recv_max_page_lsn = 0;
 }
 
@@ -841,17 +840,13 @@ recv_sys_init()
 		recv_sys->flush_end = os_event_create(0);
 	}
 
-	ulint size = buf_pool_get_curr_size();
-	/* Set appropriate value of recv_n_pool_free_frames. */
-	if (size >= 10 << 20) {
-		/* Buffer pool of size greater than 10 MB. */
-		recv_n_pool_free_frames = 512;
-	}
+	recv_n_pool_free_frames =
+		buf_pool_get_curr_chunk_size() / 3;
 
 	recv_sys->buf = static_cast<byte*>(
 		ut_malloc_nokey(RECV_PARSING_BUF_SIZE));
 
-	recv_sys->addr_hash = hash_create(size / 512);
+	recv_sys->addr_hash = hash_create(buf_pool_get_curr_size() / 512);
 	recv_sys->progress_time = time(NULL);
 	recv_max_page_lsn = 0;
 
@@ -2758,14 +2753,40 @@ recv_mlog_index_load(ulint space_id, ulint page_no, lsn_t lsn)
 	}
 }
 
+/** Check whether read redo log memory exceeds the available memory
+of buffer pool. If exceeds then assign last stored lsn, last stored
+offset
+@param[in]	store		whether to store page operations
+@param[in]	available_mem	Available memory in buffer pool to
+				read redo logs. */
+static void recv_sys_heap_check(store_t* store, ulint available_mem)
+{
+  if (store != NULL && *store != STORE_NO
+      && mem_heap_get_size(recv_sys->heap) >= available_mem)
+  {
+    *store= STORE_NO;
+    DBUG_PRINT("ib_log",("Ran out of memory and last "
+			 "stored lsn " LSN_PF "last stored offset %ld\n",
+			 recv_sys->recovered_lsn,
+			 recv_sys->recovered_offset));
+    recv_sys->last_stored_lsn= recv_sys->recovered_lsn;
+    recv_sys->last_stored_offset= recv_sys->recovered_offset;
+  }
+}
+
 /** Parse log records from a buffer and optionally store them to a
 hash table to wait merging to file pages.
-@param[in]	checkpoint_lsn	the LSN of the latest checkpoint
-@param[in]	store		whether to store page operations
-@param[in]	apply		whether to apply the records
+@param[in]	checkpoint_lsn		the LSN of the latest checkpoint
+@param[in]	store			whether to store page operations
+@param[in]	available_mem		memory to read the redo logs
+@param[in]	apply			whether to apply the records
 @return whether MLOG_CHECKPOINT record was seen the first time,
 or corruption was noticed */
-bool recv_parse_log_recs(lsn_t checkpoint_lsn, store_t store, bool apply)
+bool recv_parse_log_recs(
+	lsn_t		checkpoint_lsn,
+	store_t*	store,
+	ulint		available_mem,
+	bool		apply)
 {
 	byte*		ptr;
 	byte*		end_ptr;
@@ -2790,6 +2811,8 @@ loop:
 
 		return(false);
 	}
+
+	recv_sys_heap_check(store, available_mem);
 
 	switch (*ptr) {
 	case MLOG_CHECKPOINT:
@@ -2893,7 +2916,11 @@ loop:
 			break;
 #endif /* UNIV_LOG_LSN_DEBUG */
 		default:
-			switch (store) {
+			if (!store) {
+			  break;
+			}
+
+			switch (*store) {
 			case STORE_NO:
 				break;
 			case STORE_IF_EXISTS:
@@ -3053,6 +3080,7 @@ corrupted_log:
 			recv_sys->recovered_lsn
 				= recv_calc_lsn_on_data_add(old_lsn, len);
 
+
 			switch (type) {
 			case MLOG_MULTI_REC_END:
 				/* Found the end mark for the records */
@@ -3077,7 +3105,11 @@ corrupted_log:
 				recv_parse_or_apply_log_rec_body(). */
 				break;
 			default:
-				switch (store) {
+				if (!store) {
+					break;
+				}
+
+				switch (*store) {
 				case STORE_NO:
 					break;
 				case STORE_IF_EXISTS:
@@ -3176,7 +3208,8 @@ bool recv_sys_add_to_parsing_buf(const byte* log_block, lsn_t scanned_lsn)
 /** Moves the parsing buffer data left to the buffer start. */
 void recv_sys_justify_left_parsing_buf()
 {
-	ut_memmove(recv_sys->buf, recv_sys->buf + recv_sys->recovered_offset,
+	ut_memmove(recv_sys->buf,
+		   recv_sys->buf + recv_sys->recovered_offset,
 		   recv_sys->len - recv_sys->recovered_offset);
 
 	recv_sys->len -= recv_sys->recovered_offset;
@@ -3184,29 +3217,35 @@ void recv_sys_justify_left_parsing_buf()
 	recv_sys->recovered_offset = 0;
 }
 
-/** Scan redo log from a buffer and stores new log data to the parsing buffer.
-Parse and hash the log records if new data found.
+/** Scan redo log from a buffer and stores new log data to
+the parsing buffer.Parse and hash the log records if new data found.
 Apply log records automatically when the hash table becomes full.
+@param[in]	available_mem		we let the hash table of recs to
+					grow to this size, at the maximum
+@param[in,out]	store_to_hash		whether the records should be
+					stored to the hash table; this is
+					reset if just debug checking is
+					needed, or when the available_mem
+					runs out
+@param[in]	log_block		log segment
+@param[in]	checkpoint_lsn		latest checkpoint LSN
+@param[in]	start_lsn		buffer start LSN
+@param[in]	end_lsn			buffer end LSN
+@param[in,out]	contiguous_lsn		it is known that all groups contain
+					contiguous log data upto this lsn
+@param[out]	group_scanned_lsn	scanning succeeded upto this lsn
+@param[in]	last_phase		last phase of redo log replay
 @return true if not able to scan any more in this log group */
-static
-bool
-recv_scan_log_recs(
-/*===============*/
-	ulint		available_memory,/*!< in: we let the hash table of recs
-					to grow to this size, at the maximum */
-	store_t*	store_to_hash,	/*!< in,out: whether the records should be
-					stored to the hash table; this is reset
-					if just debug checking is needed, or
-					when the available_memory runs out */
-	const byte*	log_block,	/*!< in: log segment */
-	lsn_t		checkpoint_lsn,	/*!< in: latest checkpoint LSN */
-	lsn_t		start_lsn,	/*!< in: buffer start LSN */
-	lsn_t		end_lsn,	/*!< in: buffer end LSN */
-	lsn_t*		contiguous_lsn,	/*!< in/out: it is known that all log
-					groups contain contiguous log data up
-					to this lsn */
-	lsn_t*		group_scanned_lsn)/*!< out: scanning succeeded up to
-					this lsn */
+static bool recv_scan_log_recs(
+	ulint		available_mem,
+	store_t*	store_to_hash,
+	const byte*	log_block,
+	lsn_t		checkpoint_lsn,
+	lsn_t		start_lsn,
+	lsn_t		end_lsn,
+	lsn_t*		contiguous_lsn,
+	lsn_t*		group_scanned_lsn,
+	bool		last_phase)
 {
 	lsn_t		scanned_lsn	= start_lsn;
 	bool		finished	= false;
@@ -3349,7 +3388,8 @@ recv_scan_log_recs(
 		/* Try to parse more log records */
 
 		if (recv_parse_log_recs(checkpoint_lsn,
-					*store_to_hash, apply)) {
+					store_to_hash, available_mem,
+					apply)) {
 			ut_ad(recv_sys->found_corrupt_log
 			      || recv_sys->found_corrupt_fs
 			      || recv_sys->mlog_checkpoint_lsn
@@ -3358,20 +3398,15 @@ recv_scan_log_recs(
 			goto func_exit;
 		}
 
-		if (*store_to_hash != STORE_NO
-		    && mem_heap_get_size(recv_sys->heap) > available_memory) {
-
-			DBUG_PRINT("ib_log", ("Ran out of memory and last "
-					      "stored lsn " LSN_PF,
-					      recv_sys->recovered_lsn));
-
-			recv_sys->last_stored_lsn = recv_sys->recovered_lsn;
-			*store_to_hash = STORE_NO;
-		}
+		recv_sys_heap_check(store_to_hash, available_mem);
 
 		if (recv_sys->recovered_offset > recv_parsing_buf_size / 4) {
-			/* Move parsing buffer data to the buffer start */
+			if (last_phase && *store_to_hash == STORE_NO) {
+				recv_sys->recovered_offset =
+					recv_sys->last_stored_offset;
+			}
 
+			/* Move parsing buffer data to the buffer start */
 			recv_sys_justify_left_parsing_buf();
 		}
 	}
@@ -3423,7 +3458,7 @@ recv_group_scan_log_recs(
 	store_t	store_to_hash	= recv_sys->mlog_checkpoint_lsn == 0
 		? STORE_NO : (last_phase ? STORE_IF_EXISTS : STORE_YES);
 	ulint	available_mem	= UNIV_PAGE_SIZE
-		* (buf_pool_get_n_pages()
+		* (buf_pool_get_curr_chunk_size()
 		   - (recv_n_pool_free_frames * srv_buf_pool_instances));
 
 	group->scanned_lsn = end_lsn = *contiguous_lsn = ut_uint64_align_down(
@@ -3437,6 +3472,17 @@ recv_group_scan_log_recs(
 			redo log records before we have
 			finished the redo log scan. */
 			recv_apply_hashed_log_recs(false);
+
+			/* Ran out of memory during last phase.
+			So re-read the redo records from last stored
+			offset in recv_sys->buf. */
+			if (recv_sys->recovered_offset) {
+				recv_sys->recovered_offset =
+					recv_sys->last_stored_offset;
+			}
+
+			recv_sys->recovered_lsn =
+				recv_sys->last_stored_lsn;
 		}
 
 		start_lsn = ut_uint64_align_down(end_lsn,
@@ -3448,9 +3494,8 @@ recv_group_scan_log_recs(
 	} while (end_lsn != start_lsn
 		 && !recv_scan_log_recs(
 			 available_mem, &store_to_hash, log_sys->buf,
-			 checkpoint_lsn,
-			 start_lsn, end_lsn,
-			 contiguous_lsn, &group->scanned_lsn));
+			 checkpoint_lsn, start_lsn, end_lsn,
+			 contiguous_lsn, &group->scanned_lsn, last_phase));
 
 	if (recv_sys->found_corrupt_log || recv_sys->found_corrupt_fs) {
 		DBUG_RETURN(false);

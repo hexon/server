@@ -7500,4 +7500,26 @@ buf_page_get_trim_length(
 {
 	return (bpage->size.physical() - write_length);
 }
+
+
+ulint buf_pool_get_curr_chunk_size()
+{
+  if (!buf_pool_ptr)
+    return buf_pool_get_n_pages();
+
+  ulint	chunk_size= 0;
+
+  for (uint i= 0; i < srv_buf_pool_instances; i++)
+  {
+     buf_pool_t* buf_pool= buf_pool_from_array(i);
+
+     for (uint j = 0; j < buf_pool->n_chunks; j++)
+     {
+        const buf_chunk_t* chunk= buf_pool->chunks + j;
+	chunk_size+= chunk->size;
+     }
+  }
+
+  return chunk_size;
+}
 #endif /* !UNIV_INNOCHECKSUM */
