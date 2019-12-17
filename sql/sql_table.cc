@@ -7646,8 +7646,7 @@ static bool mysql_inplace_alter_table(THD *thd,
                                              thd->variables.lock_wait_timeout))
       goto cleanup;
 
-    tdc_remove_table(thd, TDC_RT_REMOVE_NOT_OWN_KEEP_SHARE,
-                     table->s->db.str, table->s->table_name.str);
+    table->s->tdc->tc_purge_not_own(thd);
   }
 
   /*
